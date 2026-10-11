@@ -207,6 +207,63 @@ async def main():
     seen = []; orig = job._deliver; job._deliver = lambda ev: (seen.append(ev), orig(ev))
     dt, exc = await run_with_trigger(job, lambda j: ctx.room.emit('disconnected', rtc.DisconnectReason.ROOM_DELETED), 5)
     check(exc is None and job.warm and not job.session_opened and seen == [] and job.vision.n_offered == 0 and job.vision.n_sent == 0, 'warm job: no session event, nothing offered or forwarded')
+    print('[G] a fast rejoin: the caller leaves and republishes while its old stream is still open; the new track binds, the job stays', flush=True)
+    ctx = FakeCtx(FakeRoom()); ctx.job.metadata = json.dumps({'chert_call': 'fake'}); job = make_job(ctx, cfg, perception='off', event_log=elog); keep.append(job)
+    streams = []; job.video_frames = lambda track: (streams.append(FakeVideoStream(fps=10.0)), streams[-1])[1]
+    t = asyncio.create_task(job.run()); await asyncio.sleep(0.3)
+    job.on_track_subscribed(FakeTrack(rtc.TrackKind.KIND_VIDEO), FakePub('facetime-remote-video'), P('chert-bridge'))
+    await asyncio.sleep(0.3); first = job.video_task
+    job.on_participant_disconnected(P('chert-bridge'))                     # the old stream is still running (as on the 10-10 phone page)
+    job.on_track_subscribed(FakeTrack(rtc.TrackKind.KIND_VIDEO), FakePub('facetime-remote-video'), P('chert-bridge'))
+    await asyncio.sleep(1.0)                                               # past the 0.5 s grace
+    check(not t.done() and job.end_reason is None and job.bound == 'chert-bridge' and job.video_task is not first and first.done()
+          and len(streams) == 2 and streams[0].closed and not streams[1].closed, 'rebound on the new track, old stream closed, job still running past the grace')
+    job.on_track_subscribed(FakeTrack(rtc.TrackKind.KIND_VIDEO), FakePub('facetime-remote-video'), P('someone-else'))
+    check(len(streams) == 2, 'a second caller while one is bound is still ignored')
+    ctx.room.emit('disconnected', rtc.DisconnectReason.ROOM_DELETED)
+    try: await asyncio.wait_for(t, 5); exc = None
+    except Exception as e: exc = e
+    check(exc is None and job.end_reason.startswith('room disconnected'), f'ended on the disconnect ({job.end_reason})')
+    print('[H] --mirror: a coach-video track is published at join and fed (the face alone, then the composed caller frame); the job still ends promptly', flush=True)
+    import numpy as np
+    ctx = FakeCtx(FakeRoom()); ctx.job.metadata = json.dumps({'chert_call': 'fake'}); job = make_job(ctx, cfg); keep.append(job); job.a.mirror = True; job.a.mirror_fps = 10.0
+    pubs = []; orig_pub = ctx.room.local_participant.publish_track
+    async def pub(track, opts): pubs.append(track); return await orig_pub(track, opts)
+    ctx.room.local_participant.publish_track = pub
+    frames = []; orig_frame = job._mirror_frame
+    job._mirror_frame = lambda *a: (frames.append(job.mirror_src is not None), orig_frame(*a))[1]
+    t = asyncio.create_task(job.run()); await asyncio.sleep(1.0)
+    n_face = len(frames)
+    job.mirror_src = (np.zeros((720, 1280, 3), np.uint8), None); job.last_cue = ('Sink lower', time.time())   # as the feed thread sets it after a frame
+    await asyncio.sleep(0.6)
+    check(any(getattr(p, 'name', '') == 'coach-video' for p in pubs) and job.mirror_task is not None and not job.mirror_task.done(), f'coach-video published, mirror running ({len(pubs)} tracks)')
+    check(n_face >= 5 and any(frames[n_face:]), f'{n_face} face-only frames before a caller frame, then {sum(frames[n_face:])} composed frames')
+    t0 = time.monotonic(); ctx.room.emit('disconnected', rtc.DisconnectReason.ROOM_DELETED)
+    try: await asyncio.wait_for(t, 5); exc = None
+    except Exception as e: exc = e
+    check(exc is None and time.monotonic() - t0 < 1.5 and job.mirror_task.done(), f'ended {1000 * (time.monotonic() - t0):.0f} ms after the disconnect, mirror stopped')
+    print('[I] outside a set, bank lines wait while the voice talks (no chopped sentence); counts never wait; stale lines are dropped', flush=True)
+    ctx = FakeCtx(FakeRoom()); job = make_job(ctx, cfg); keep.append(job); job.loop = asyncio.get_running_loop()
+    said = []
+    class FakePlayer:
+        mix = type('M', (), {'pending': 0})()
+        def say(self, text, intent, meta=None): said.append(text)
+    job.player = FakePlayer(); talking = {'on': True}
+    job._voice_audible = lambda: talking['on']
+    job.session_state = 'rest'
+    job._say_or_defer('Step back so I can see your whole body', 'visibility', {}); job._say_or_defer('Rest for a moment', 'positive', {})
+    await asyncio.sleep(0.3)
+    check(said == [] and len(job.deferred_cues) == 2, f'two lines wait while the voice talks (said {said})')
+    talking['on'] = False; await asyncio.sleep(0.6)
+    check(said == ['Step back so I can see your whole body', 'Rest for a moment'] and not job.deferred_cues, f'played in order once the voice was quiet: {said}')
+    said.clear(); talking['on'] = True; job.session_state = 'active'
+    job._say_or_defer('Three', 'count', {}); job._say_or_defer('Step back so I can see your whole body', 'visibility', {})
+    check(said == ['Three', 'Step back so I can see your whole body'], f'during a set nothing waits: {said}')
+    said.clear(); job.session_state = 'rest'
+    job._say_or_defer('Rest for a moment', 'positive', {}); job._say_or_defer("Let's do pushups", 'announce', {})
+    await asyncio.sleep(0.2); job.session_state = 'active'; await asyncio.sleep(0.3)
+    check(said == ["Let's do pushups"], f'a set started while they waited: the stale praise is dropped, the announce still plays ({said})')
+    job.player = None; await job.aclose()                                  # the fake player has no audio to drain
     try: os.remove(elog)
     except OSError: pass
     n = len(PASS); ok = sum(PASS); print(f'\n{ok}/{n} checks passed' + ('' if ok == n else '  <-- FAILURES'), flush=True)

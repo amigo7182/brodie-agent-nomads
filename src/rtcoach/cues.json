@@ -2222,5 +2222,37 @@
 "yoga pushup - too slow": {
 "cue": "Pick up the pace",
 "kind": "fault"
+},
+"brodie extras - halfway": {
+"cue": "Halfway there",
+"kind": "good"
+},
+"brodie extras - last one": {
+"cue": "Last one",
+"kind": "good"
+},
+"brodie extras - two more": {
+"cue": "Two more",
+"kind": "good"
+},
+"brodie extras - light weight": {
+"cue": "Light weight, keep pushing",
+"kind": "good"
+},
+"brodie extras - boxing hands up": {
+"cue": "Hands up",
+"kind": "good"
+},
+"brodie extras - boxing chin down": {
+"cue": "Chin down",
+"kind": "good"
+},
+"brodie extras - boxing widen stance": {
+"cue": "Widen your stance",
+"kind": "good"
+},
+"brodie extras - boxing good guard": {
+"cue": "Good guard, keep it up",
+"kind": "good"
 }
 }

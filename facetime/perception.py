@@ -52,6 +52,10 @@ class Config:
     auto_classes: str = 'demo'
     announce: bool = True
     gesture_next: bool = False       # T-pose command (facetime/probe.py TPose)
+    intake: bool = False             # plan mode: wait in 'intake' until set_plan() (the voice's choose_workout tool) or the timeout
+    intake_timeout_s: float = 60.0
+    lost_close_s: float = 15.0       # close a set whose caller has been out of view this long (0 = wait forever, the old behaviour)
+    rest_autostart: bool = True      # the first rep of the next exercise during a rest starts its set (no "ready" needed)
     latency_probe: bool = False      # probe events are emitted anyway; this only tells a caller with audio to beep
     auto_lite: bool = True           # live only: drop the pose model to lite when full cannot hold 10 fps
     status_every_s: float = 5.0
@@ -81,6 +85,11 @@ def add_arguments(ap):
     ap.add_argument('--auto-classes', default=d.auto_classes, choices=['demo', 'all'])
     ap.add_argument('--no-announce', dest='announce', action='store_false', help="skip the \"Let's do <exercise>\" line")
     ap.add_argument('--gesture-next', action='store_true', help='a T-pose held 1.5 s closes the set / skips the rest and emits a gesture event (without it no T-pose detector runs: no gesture events)')
+    ap.add_argument('--intake', action='store_true', default=d.intake, help='plan mode: before the first set the voice asks the caller\'s goal and level and picks the plan '
+                                                                            '(starter/programs.py, the choose_workout tool); the --plan runs if nothing is chosen in --intake-timeout-s')
+    ap.add_argument('--intake-timeout-s', type=float, default=d.intake_timeout_s)
+    ap.add_argument('--no-rest-autostart', dest='rest_autostart', action='store_false', help='a rest always runs its full length (or until "ready")')
+    ap.add_argument('--lost-close-s', type=float, default=d.lost_close_s, help='close a set after the caller has been out of view this long (0 = wait forever)')
     ap.add_argument('--latency-probe', action='store_true', help='with audio attached: beep the instant both wrists go above the head')
     ap.add_argument('--no-auto-lite', dest='auto_lite', action='store_false')
     return ap
@@ -142,7 +151,8 @@ class Perception:
         self.say_cb = say
         self.session = Session(self.pipe, self._say, fps=fps, plan=cfg.plan, exercise=cfg.exercise, announce=cfg.announce,
                                rest_s=cfg.rest_s, set_timeout_s=cfg.set_timeout, tempo=load_json_arg(cfg.tempo, None),
-                               auto_classes=cfg.auto_classes, clip_s=self.clip_s, gesture_next=bool(cfg.gesture_next))
+                               auto_classes=cfg.auto_classes, clip_s=self.clip_s, gesture_next=bool(cfg.gesture_next),
+                               intake=bool(cfg.intake), intake_timeout_s=cfg.intake_timeout_s, lost_close_s=cfg.lost_close_s, rest_autostart=cfg.rest_autostart)
         self.mode = self.session.mode
         self._cbs = []; self._writers = []; self.seq = 0; self.n = 0; self.closed = False
         self.frames_received = None; self.frames_dropped = None; self.audio_stats = None   # a transport sets these for the status event
@@ -274,10 +284,12 @@ class Perception:
     def _session_event(self, force=False):
         s = self.session
         ex = spoken_name(self.pipe.exercise) if self.pipe.exercise else (spoken_name(s.name) if s.name and s.state in ('wait', 'active') else None)
+        if s.state in ('rest', 'done', 'intake', 'init'): ex = None            # a rest's warmed-up next counter (auto-start) is not announced yet
         key = (s.state, ex, s.target, s.k, bool(s.done))
         if force or key != self._sess_key:
             self._sess_key = key
-            self._emit('session', state=s.state, exercise=ex, target=s.target, count=s.last_count, item=(s.k if s.mode == 'plan' else None), done=bool(s.done), mode=s.mode)
+            self._emit('session', state=s.state, exercise=ex, target=s.target, count=s.last_count, item=(s.k if s.mode == 'plan' else None), done=bool(s.done), mode=s.mode,
+                       items=(len(s.plan) if s.plan else None))
 
     def _status(self, r, t_mono):
         w = self._win

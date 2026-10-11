@@ -89,6 +89,35 @@ Only these three files:
 
 The same pages are at [seraphimlabs.dev/hackathon](https://seraphimlabs.dev/hackathon).
 
+## What Nomads built (IvyHacks: Beat Muse)
+
+A FaceTime fitness coach that sets up your workout by talking to you, shows you your own form on the call, and hands you a
+card to share at the end. No app: call the number.
+
+Run it (phone page or FaceTime, same command; add `--agent-name <name>` for the Chert line):
+```
+python -m facetime.worker --voice gemini --intake --mirror --log-caller dev
+```
+
+| Feature | What the caller gets | Where |
+|---|---|---|
+| Voice intake | Brodie asks your goal (strength, cardio, full body) and level (easy, medium, hard), then builds the workout from fixed templates via a `choose_workout` tool (the model never invents reps) | `--intake`, `starter/programs.py`, `facetime/session.py` |
+| Camera view | Your own camera image with the pose skeleton, the rep count, Brodie's last line and his animated face, as the coach's FaceTime video | `--mirror`, `facetime/worker.py` (renderer `facetime/mirror.py`) |
+| "I'm ready" | Say "let's go" during a rest and the next exercise starts (`start_next_set` tool) | `facetime/worker.py`, `facetime/session.py` |
+| Honest about the camera | Ask "can you see me?" and Brodie answers from the pose tracker (`check_view` tool), not a guess | `facetime/worker.py` |
+| Streak | "Day 3 in a row": counted per caller (Chert's hashed handle when present), mentioned in the greeting and the close | `facetime/recap.py` |
+| Results card | A 1080x1350 PNG after every call: sets, reps, streak and next-time focus, ready to post | `facetime/recap.py`, saved to `data/cards/` |
+| Boxing lessons | Pick a Soviet, Mexican or Cuban style lesson in the intake: Brodie teaches the stance, guard and big idea, then runs 3 timed shadowboxing rounds; mid-round cues come from the pose tracker's guard and stance measurements (`check_form`), and the screen shows the style and the round clock | `starter/boxing.py`, `start_boxing_lesson` in `facetime/worker.py` |
+| Motivation and tips | "Halfway there", "Two more", "Last one" on the fast path; a short recovery or hydration tip every other rest; a stretch at the end | `starter/handlers.py`, `src/rtcoach/cues.json` |
+
+Fixes to the starter we needed on the way (they help every team): the phone page now sends the caller's microphone and
+joins once; a fast rejoin no longer ends the call; Brodie's prompts are sent as user-role notes, so the model no longer reads
+instructions aloud; pre-recorded lines wait for Brodie to finish a sentence outside a set; a set no longer starts over his
+own sentence; a set closes after 15 s out of view instead of waiting forever (`--lost-close-s`); no double "great session".
+
+Tests: `scripts/test_intake.py`, `scripts/test_recap.py`, `scripts/test_boxing.py`, and new scenarios in `scripts/test_worker_shutdown.py`, next to the
+starter's own suites. The licensed model files are untouched.
+
 ## Licence
 
 The models and the thresholds (`clf_pose.pt`, `trigger_lr.json`, `src/rtcoach/thresholds_e3c.json`, `src/rtcoach/cue_prior.json`) come from a research evaluation licence. Use them for this hackathon only and do not redistribute them.

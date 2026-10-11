@@ -48,7 +48,8 @@ PLAN_PATH = os.path.join(STARTER_DIR, 'plan.txt')
 HANDLERS_PATH = os.path.join(STARTER_DIR, 'handlers.py')
 DEFAULT_MODEL = 'gemini-3.8-live'          # measured here 0.9 to 1.3 s to first audio on a text turn; gemini-2.5-flash-native-audio-preview-12-2025 2.5 to 3.0 s
 DEFAULT_VOICE = 'Puck'                     # the voice of the cue bank (data/cues_audio_gemini)
-OPEN_STATES = ('wait', 'rest', 'done')     # the session states in which the model may speak
+COACH_NOTE = 'Coach note (from the coaching system, not the caller; never read it aloud or mention it): '
+OPEN_STATES = ('intake', 'lesson', 'wait', 'rest', 'done')     # the session states in which the model may speak (intake: --intake, before the first set)
 WINDOW_S = 4.0                             # a gesture or probe opens the floor this long (never during an active set)
 QUEUE_MAX = 3                              # ask_voice prompts kept while the floor is closed (oldest dropped)
 ASK_TTL_S = 15.0                           # a queued ask older than this is dropped at the opening (a stale answer is worse than silence)
@@ -192,14 +193,18 @@ class SetSummary:
     """The context lines fed at slot openings: what the fast path did in the set that just ended, and what comes next."""
     def __init__(self, plan=None):
         self.plan = parse_plan(plan); self.reset(); self.sets = []; self.item = None; self.target = None
+        self.done_note = None                                              # set by the worker once the streak is known (facetime/recap.py)
+        self.rest_s = 5.0                                                  # the session's rest (the intake may change it), set before each text()
 
     def reset(self):
-        self.exercise = None; self.reps = 0; self.faults = {}; self.cues = []; self.why = None
+        self.exercise = None; self.reps = 0; self.faults = {}; self.cues = []; self.why = None; self.open = False
 
     def on_event(self, ev):
         t = ev['type']
         if t == 'session':
+            if ev.get('state') == 'wait' and ev.get('item') == 0: self.sets = []        # a fresh plan (the intake may have replaced the configured one)
             if ev.get('exercise'): self.exercise = ev['exercise']
+            if ev.get('state') in ('wait', 'active'): self.open = True
             if ev.get('item') is not None: self.item = ev['item']
             if ev.get('target') is not None: self.target = ev['target']
             if ev.get('state') == 'rest' or ev.get('done'): self.reps = max(self.reps, ev.get('count') or 0)
@@ -219,6 +224,11 @@ class SetSummary:
         rest/done. None at `wait`: run B on 10-09 showed a "Starting lunges ..." line answered right before the set and heard
         under the counts (the floor stays open at wait for a caller's question, but nothing invites a line)."""
         ex = self.exercise or 'the exercise'; tgt = f' of {self.target}' if self.target else ''
+        if state == 'done' and not self.open and not self.sets:            # a boxing lesson (no sets): the worker's note is the whole context
+            return (self.done_note + ' ' if self.done_note else '') + 'Never read these notes aloud; speak to the caller in your own words.' if self.done_note else None
+        if state == 'done' and not self.open:                             # the last set was already summed up at its rest: no empty second summary
+            return ('The whole plan is done: ' + '; '.join(f'{e} {r} reps' for e, r in self.sets) + '. Close the session warmly in one or two sentences. '
+                    + (self.done_note + ' ' if self.done_note else '') + 'Never read these notes, the plan or any list aloud; speak to the caller in your own words.')
         if state in ('rest', 'done'):
             corr = sorted(self.faults.items(), key=lambda kv: -kv[1])
             spoken = [txt for intent, txt in self.cues if intent == 'correction']
@@ -227,9 +237,11 @@ class SetSummary:
             if corr: parts.append('Faults seen: ' + ', '.join(f'{lab} x{n}' for lab, n in corr[:3]) + '.')
             nxt = self.next_item()
             if state == 'done':
-                parts.append('The whole plan is done: ' + '; '.join(f'{e} {r} reps' for e, r in self.sets + [(ex, self.reps)]) + '. Close the session warmly in one or two sentences.')
-            elif nxt: parts.append(f'Next up: {nxt[0]}' + (f' x {nxt[1]}' if nxt[1] else '') + ' after a five second rest. You may say one or two short sentences now.')
-            else: parts.append('The rest lasts five seconds. You may say one or two short sentences now.')
+                parts.append('The whole plan is done: ' + '; '.join(f'{e} {r} reps' for e, r in self.sets + [(ex, self.reps)]) + '. Close the session warmly in one or two sentences.'
+                             + (' ' + self.done_note if self.done_note else ''))
+            elif nxt: parts.append(f'Next up: {nxt[0]}' + (f' x {nxt[1]}' if nxt[1] else '') + f' after a rest of up to {self.rest_s:.0f} seconds; it starts '
+                                   'by itself as soon as the caller starts moving, or when they say they are ready. You may say one or two short sentences now.')
+            else: parts.append(f'The rest lasts {self.rest_s:.0f} seconds. You may say one or two short sentences now.')
             parts.append('Never read these notes, the plan or any list aloud; speak to the caller in your own words.')   # 2026-10-10: he opened every rest with "Plan: squats:10,pushups:8,..."
             self.sets.append((ex, self.reps)); self.reset()
             return ' '.join(parts)
@@ -435,8 +447,8 @@ class MixerAudioOutput(_AudioOutputBase):
 class GeminiModel:
     """The livekit-agents AgentSession with Gemini Live, output through MixerAudioOutput, input from the caller's room audio.
     start() is called once a caller is bound (a warm job never starts it: no model session, no cost)."""
-    def __init__(self, persona, model=None, voice=None, api_key=None, on_turn=None, temperature=None, language=None):
-        self.persona = persona; self.model_id = model or os.environ.get('GEMINI_LIVE_MODEL') or DEFAULT_MODEL
+    def __init__(self, persona, model=None, voice=None, api_key=None, on_turn=None, temperature=None, language=None, tools=None):
+        self.tools = list(tools or []); self.persona = persona; self.model_id = model or os.environ.get('GEMINI_LIVE_MODEL') or DEFAULT_MODEL
         self.voice = voice or os.environ.get('GEMINI_VOICE') or DEFAULT_VOICE
         self.api_key = api_key or os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
         lang = language if language is not None else os.environ.get('GEMINI_LANGUAGE', DEFAULT_LANGUAGE)
@@ -472,7 +484,7 @@ class GeminiModel:
         self.session = AgentSession(llm=self.rt, user_away_timeout=None, **(dict(video_sampler=None) if video is not None else {}))
         self.session.output.audio = sink                                  # before start: RoomIO then publishes no audio track
         if video is not None: self.session.input.video = video            # before start: the forward task starts with the session
-        self.agent = Agent(instructions=self.persona, allow_interruptions=True)
+        self.agent = Agent(instructions=self.persona, allow_interruptions=True, **(dict(tools=self.tools) if self.tools else {}))
         self.session.on('conversation_item_added', self._on_item)
         self.session.on('user_input_transcribed', self._on_user_transcript)
         self.session.on('error', lambda ev: log.warning('voice session error: %s', getattr(ev, 'error', ev)))
@@ -505,7 +517,10 @@ class GeminiModel:
     def generate(self, prompt):
         if self.session is None: return None
         self.n_generate += 1
-        try: return self.session.generate_reply(instructions='(Private instruction for you, never say it aloud; answer the caller in your own words.) ' + prompt)   # 2026-10-10: he read the prompts verbatim
+        # A user-role note, not instructions=: livekit-plugins-google sends instructions as a MODEL turn, so Gemini took the bracketed
+        # prompt for its own words and continued in that style (2026-10-10 calls: "(No instructions in response. Only say the
+        # response.)" and whole paragraphs of reasoning were spoken). The set summaries already arrive as user-role context.
+        try: return self.session.generate_reply(user_input=COACH_NOTE + prompt)
         except RuntimeError as e: log.warning('generate_reply: %s', e); return None
 
     def interrupt(self):
@@ -517,7 +532,7 @@ class GeminiModel:
     async def add_context(self, text):
         if self.agent is None or not text: return
         try:
-            ctx = self.agent.chat_ctx.copy(); ctx.add_message(role='user', content=text)
+            ctx = self.agent.chat_ctx.copy(); ctx.add_message(role='user', content=COACH_NOTE + text)
             await self.agent.update_chat_ctx(ctx)
         except Exception as e: log.warning('add_context: %s', e)
 
@@ -571,6 +586,7 @@ class VoiceLayer:
             if self.vision is not None: self.vision.enable(True)                       # frames offered before this point were never sent
             if self.pending_context: await self.model.add_context(self.pending_context[-1])   # the latest line only, never a backlog
             self.pending_context = []
+            if self.floor.open and self.floor.queue and not self.floor._audio_busy(): self.floor._fire_queue()   # an ask made before the session was up
             return True
         except Exception as e:
             log.exception('voice model start failed'); print(f'[voice] model start failed: {type(e).__name__}: {e}', flush=True)
@@ -590,7 +606,19 @@ class VoiceLayer:
             if not self._warned_no_model:
                 self._warned_no_model = True; print(f'[voice] ask_voice ignored: no model (--voice off); first prompt {prompt[:60]!r}', flush=True)
             return None
+        if self.model is not None and not self.model.started:                 # the intake greeting can come before the session is up
+            self.floor.queue.append((self.floor.now(), prompt)); return 'queued'
         return self.floor.ask(prompt)
+
+    def set_plan(self, plan, rest_s=None):
+        """Intake: hand the chosen plan to the session (it starts on a later frame); the set summary's "Next up" follows it.
+        Returns None when accepted, else why not."""
+        per = getattr(self.job, 'per', None)
+        if per is None: return 'no session (perception off)'
+        why = per.session.set_plan(plan, rest_s)
+        if why is None: self.summary.plan = parse_plan(plan)
+        print(f'[voice] intake: plan {plan!r}, rest {rest_s} s -> ' + ('accepted' if why is None else f'refused: {why}'), flush=True)
+        return why
 
     # ---- events ----
     def on_event(self, ev):
@@ -602,6 +630,8 @@ class VoiceLayer:
         change = self.floor.on_event(ev) if self.floor is not None else None
         t = ev['type']
         if t == 'session' and ev.get('state') in ('rest', 'done'):
+            per = getattr(self.job, 'per', None)
+            if per is not None: self.summary.rest_s = per.session.rest_s
             text = self.summary.text(ev['state'])
             if text and self.floor is not None: self._context(text)
         elif change == 'open' and t in ('gesture', 'probe'):
@@ -627,10 +657,12 @@ class VoiceLayer:
         per = getattr(self.job, 'per', None)
         if per is None or self.floor is None or self.model is None: return
         now = time.monotonic(); want = False
-        if self.floor.open and self.floor.state in ('wait', 'rest'):
+        if self.floor.open and self.floor.state in ('intake', 'wait', 'rest'):
             if self._hold_opened is None: self._hold_opened = now
             last = max(getattr(self.model, 'last_caller_t', -1e9), getattr(self.model, 'last_coach_t', -1e9), self._last_voice_audio_t, self.floor.t_ask or -1e9)
-            want = (now - last) < self.HOLD_QUIET_S and (now - self._hold_opened) < self.HOLD_MAX_S
+            capped = (now - self._hold_opened) >= self.HOLD_MAX_S and self.floor.state != 'intake'   # the intake is a conversation: no cap
+            audible = (self.mix is not None and self.mix.pending > 0) or bool(getattr(self.model, 'started', False) and getattr(self.model, 'speaking', False))
+            want = audible or ((now - last) < self.HOLD_QUIET_S and not capped)   # never start a set over Brodie's own sentence
         else:
             self._hold_opened = None
         if self.mix is not None and self.mix.pending > 0: self._last_voice_audio_t = now

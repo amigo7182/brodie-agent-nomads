@@ -56,6 +56,7 @@ Run:
 The flags before the LiveKit subcommand are ours; `dev`, `start`, `connect`, `download-files` and their options are the LiveKit Agents CLI's.
 """
 import argparse, asyncio, collections, json, logging, os, sys, threading, time
+import numpy as np
 from livekit import rtc
 from livekit.agents import AutoSubscribe, JobContext, JobProcess, WorkerOptions, cli
 from facetime import DATA, AUDIO_TRACK_NAME
@@ -123,6 +124,10 @@ def build_parser():
                                                                                                         'open = always allowed to speak, nothing is ever cut (the default with --perception off; env FLOOR)')
     ap.add_argument('--vision', action='store_true', default=truthy(os.environ.get('VISION')), help='with --voice gemini: tee the caller\'s video into the model session at --vision-fps (env VISION=1)')
     ap.add_argument('--vision-fps', type=float, default=float(os.environ.get('VISION_FPS', '1') or 1), help='frames per second handed to the model with --vision (default 1, at most 2; JPEG per frame)')
+    ap.add_argument('--mirror', action='store_true', default=truthy(os.environ.get('MIRROR')), help='publish a video track "coach-video": the caller\'s own frame with the pose, '
+                    'the count and the last cue drawn on it and Brodie\'s face inset (facetime/mirror.py, as coach_agent --mirror); before the first frame, and with '
+                    '--perception off, Brodie\'s face alone. The FaceTime caller sees it (env MIRROR=1)')
+    ap.add_argument('--mirror-fps', type=float, default=float(os.environ.get('MIRROR_FPS', '10') or 10), help='frame rate of the --mirror track (default 10)')
     ap.add_argument('-h', '--help', action='store_true', help='show this help and exit')
     return ap
 
@@ -152,11 +157,37 @@ def resolve_mode(a):
         if a.exercise: a.plan = None
         elif getattr(a, 'auto', False): a.plan = None
         else: a.plan = a.plan or os.environ.get('PLAN') or read_plan_file(getattr(a, 'plan_file', None)) or DEFAULT_PLAN
+    if getattr(a, 'intake', False) and (perception_off(a) or a.voice != 'gemini' or not a.plan):
+        if ARGS_ENV not in os.environ: print('[worker] --intake needs plan mode with --voice gemini (the voice asks and picks the plan): intake OFF', flush=True)
+        a.intake = False
     a.vision_fps = max(0.1, min(float(getattr(a, 'vision_fps', 1.0) or 1.0), 2.0))
     h = getattr(a, 'handlers', None)
     if h and str(h).strip().lower() in ('none', 'off'): a.handlers = 'none'          # kept as the string: the job process resolves the flags again
     elif not h and os.path.exists(os.path.join(STARTER_DIR, 'handlers.py')): a.handlers = os.path.join(STARTER_DIR, 'handlers.py')
     return a
+
+
+SESSION_TOOLS_PROMPT = (
+    "\n\nYou cannot see the caller's video: a pose tracker watches them for you. If the caller asks whether you can see them or how "
+    "to stand, call the check_view tool and answer from it; never guess. When the caller says they are ready during a rest (for example "
+    "\"let's go\", \"I'm ready\", \"next\"), call the start_next_set tool. Call tools only through function calling: never write JSON, "
+    "code or a tool's name in what you say."
+)
+
+
+def load_starter(name):
+    """A team-editable module from starter/ (programs.py, boxing.py)."""
+    import importlib.util
+    path = os.path.join(STARTER_DIR, name)
+    spec = importlib.util.spec_from_file_location('starter_' + name[:-3], path); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    return mod
+
+
+def load_programs(path=os.path.join(STARTER_DIR, 'programs.py')):
+    """starter/programs.py: the intake's workout templates (GOALS, LEVELS, INTAKE_PROMPT, build)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('starter_programs', path); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    return mod
 
 
 def handlers_path(a):
@@ -248,6 +279,12 @@ class CoachJob:
         self.session_state = None; self.probes_ignored = 0        # the probe (--latency-probe) never beeps or opens the floor during an active set
         self.voice_mode = perception_off(a)                       # --perception off: no Perception; the worker emits its own session/status events
         self.t0 = time.monotonic(); self.ev_seq = 0; self.vision = None; self.vision_logged = False; self.session_opened = False; self.open_task = None
+        self.mirror_src = None; self.last_cue = (None, 0.0); self.mirror_task = None
+        self.deferred_cues = []; self.defer_task = None             # bank lines waiting for the voice to finish (outside a set)
+        from facetime.recap import CallRecap, Streaks, profile_key
+        self.recap = CallRecap(); self.streaks = Streaks(); self.profile = profile_key(md); self.day = None   # the streak and the results card
+        self.card_img = None; self.card_path = None                  # at "done": the card is saved and shown as the coach's video (--mirror)
+        self.lesson = None; self.lesson_task = None; self.boxing = None # a boxing lesson (starter/boxing.py): {style, title, status}   # --mirror: the newest processed frame and the last cue played
 
     # ---- lifecycle ----
     async def run(self):
@@ -278,6 +315,8 @@ class CoachJob:
             await self.room.local_participant.publish_track(self.player.track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE))
             self.player_task = asyncio.create_task(self.player.run())
             print(f'[worker] published audio track {AUDIO_TRACK_NAME}', flush=True)
+        if getattr(a, 'mirror', False):
+            self.mirror_task = asyncio.create_task(self.mirror_loop(), name='mirror')
         if self.voice_mode:                                       # no Perception: the worker's own session/status events, logged the same way
             from facetime.perception import JsonlWriter
             self.event_writer = JsonlWriter(a.event_log, extra=dict(room=self.room.name, call_id=self.call_id, job=ctx.job.id))
@@ -333,10 +372,14 @@ class CoachJob:
         """Idempotent cleanup (run() at its end, and the framework's shutdown callback): every wait is bounded, nothing blocks the loop."""
         if self.closed: return
         self.closed = True; self.stop.set(); self.done.set(); t0 = time.monotonic()
+        if self.lesson_task is not None: self.lesson_task.cancel()
+        if (self.recap.sets or self.recap.lesson) and not self.warm and self.card_path is None: self.make_card()       # a call that ended before "All done"
         if self.t_end is None: self.t_end = t0
         if self.leave_task is not None: self.leave_task.cancel()
         if self.open_task is not None and not self.open_task.done(): self.open_task.cancel()
         for t in getattr(self, 'consumer_tasks', []): t.cancel()
+        if self.mirror_task is not None: self.mirror_task.cancel()
+        if self.defer_task is not None: self.defer_task.cancel()
         if self.video_task is not None and not self.video_task.done():                 # closes the VideoStream (read_video's finally)
             self.video_task.cancel()
             try: await asyncio.wait_for(asyncio.gather(self.video_task, return_exceptions=True), 1.0)
@@ -386,7 +429,12 @@ class CoachJob:
         if own:
             print(f'[worker] video from agent participant {participant.identity!r} ignored', flush=True); return
         if self.video_task is not None and not self.video_task.done():
-            print(f'[worker] video track {pub.name!r} from {participant.identity!r} ignored: already bound to {self.bound!r}', flush=True); return
+            if self.bound is not None and self.bound != participant.identity:
+                print(f'[worker] video track {pub.name!r} from {participant.identity!r} ignored: already bound to {self.bound!r}', flush=True); return
+            # the bound caller left (or republished) and its old stream has not ended yet: a fast rejoin, a duplicate identity
+            # kicking the first, a camera switch. Drop the old stream and bind the new track, or the leave grace ends the job.
+            print(f'[worker] video track {pub.name!r} from {participant.identity!r} replaces the previous stream (rejoin)', flush=True)
+            self.video_task.cancel()
         self.bind(participant, f'video {pub.name!r} {pub.width}x{pub.height}, simulcast {getattr(pub, "simulcasted", False)}')
         if self.a.video_quality != 'none' and getattr(pub, 'simulcasted', False):
             try: pub.set_video_quality(rtc.VideoQuality.Value('VIDEO_QUALITY_' + self.a.video_quality.upper()))
@@ -440,7 +488,7 @@ class CoachJob:
         finally:
             await stream.aclose()
         print('[worker] video stream ended (a republished track is picked up again)', flush=True)
-        self.video_task = None
+        if self.video_task is asyncio.current_task(): self.video_task = None     # a rejoin may already have started the next one
 
     # ---- voice mode (--perception off): the worker's own events ----
     def emit(self, type_, **fields):
@@ -511,18 +559,69 @@ class CoachJob:
             self.per.frames_received = self.seq; self.per.frames_dropped = self.dropped
             self.per.process_frame(rgb, t_recv=t_mono, meta=dict(frame_seq=seq, ts_us=ts_us, t_capture=self.capture_time(ts_us, t_wall), t_recv=t_wall))
             self.processed += 1
+            if self.mirror_task is not None: self.mirror_src = (rgb, self.pipe.last_landmarks)   # one tuple, swapped whole: the mirror reads it on the loop
             if self.a.max_s and t_mono - self.first_frame_t >= self.a.max_s:
                 print(f'[worker] --max-s {self.a.max_s} reached', flush=True); self.loop.call_soon_threadsafe(self.end, 'max_s reached'); break
 
     # ---- sinks ----
+    DEFER_INTENTS = ('visibility', 'positive', 'announce', 'other')
+    DEFER_MAX_S = 8.0
+
     def say_from_worker(self, text, intent, meta):
-        self.loop.call_soon_threadsafe(self.player.say, text, intent, meta)
+        self.loop.call_soon_threadsafe(self._say_or_defer, text, intent, meta)
+
+    def _voice_audible(self):
+        """The conversational voice is talking (a reply in progress or its audio still in the mixer)."""
+        mix = getattr(self.player, 'mix', None) if self.player is not None else None
+        model = getattr(self.voice, 'model', None) if self.voice is not None else None
+        return (mix is not None and mix.pending > 0) or bool(model is not None and getattr(model, 'started', False) and getattr(model, 'speaking', False))
+
+    def _say_or_defer(self, text, intent, meta):
+        """Outside a set, a bank line ("Step back ...", "Rest for a moment", "Let's do X") waits while the voice is talking instead of
+        chopping its sentence (2026-10-10: the player paused the reply for each clip). Counts, corrections and milestones go at once."""
+        if intent == 'visibility' and self.session_state == 'lesson':        # shadowboxing flickers in and out of frame: no "Step back" chatter
+            print(f'[cue] skipped during the lesson: {text!r}', flush=True); return
+        if intent in self.DEFER_INTENTS and self.session_state != 'active' and self._voice_audible():
+            self.deferred_cues.append((time.monotonic(), text, intent, meta))
+            print(f'[cue] waiting for the voice to finish: {text!r} ({intent})', flush=True)
+            if self.defer_task is None: self.defer_task = asyncio.create_task(self._flush_deferred(), name='cue-defer')
+            return
+        self.player.say(text, intent, meta)
+
+    async def _flush_deferred(self):
+        """Play the waiting lines once the voice has been quiet for 0.3 s; a set start or DEFER_MAX_S drops the stale ones
+        (an announce always plays: the set needs it)."""
+        quiet_since = None
+        try:
+            while self.deferred_cues and not self.closed:
+                await asyncio.sleep(0.05); now = time.monotonic()
+                audible = self._voice_audible(); quiet_since = None if audible else (quiet_since or now)
+                oldest = now - self.deferred_cues[0][0]
+                if (quiet_since is not None and now - quiet_since >= 0.3) or self.session_state == 'active' or oldest >= self.DEFER_MAX_S:
+                    cues, self.deferred_cues = self.deferred_cues, []
+                    for t0, text, intent, meta in cues:
+                        stale = self.session_state == 'active' or now - t0 >= self.DEFER_MAX_S
+                        if intent == 'announce' or not stale: self.player.say(text, intent, meta)
+                        else: print(f'[cue] dropped (stale after waiting for the voice): {text!r}', flush=True)
+        finally:
+            self.defer_task = None
 
     def on_event(self, ev):
         """Perception thread -> event loop: the queue, the console, the optional data channel. The arms-up probe beeps here (say_now
         from the loop, as coach_agent does) only with --latency-probe, the cue player attached and no set active (run B on 10-09: a
         jumping jack is an arm raise), and the event says so (beep) before it is logged; a probe during a set is emitted, not acted on."""
         if ev['type'] == 'session': self.session_state = ev.get('state')
+        self.recap.on_event(ev)
+        if ev['type'] == 'session' and ev.get('state') in ('rest', 'done') and (ev.get('count') or 0) > 0 and self.day is None and not self.warm:
+            try:
+                self.day = self.streaks.record(self.profile)                 # the first finished set of the call counts the day
+                print(f"[recap] streak: day {self.day['current']} (best {self.day['best']}) for profile {self.profile}", flush=True)
+                if self.voice is not None:
+                    self.voice.summary.done_note = (f"This was day {self.day['current']} in a row for the caller" + (f" (their best is {self.day['best']})" if self.day['best'] > self.day['current'] else ' (a new best)') +
+                                                    '; mention it in the close.' if self.day['current'] > 1 else 'This was their first day: invite them to come back tomorrow and start a streak.')
+            except Exception as e: log.warning('streak: %r', e)
+        if ev['type'] == 'session' and ev.get('state') == 'done' and (self.recap.sets or self.recap.lesson) and self.card_path is None and not self.warm:
+            self.make_card()
         if ev['type'] == 'probe':
             armed = bool(getattr(self.a, 'latency_probe', False)); active = self.session_state == 'active'
             if active: self.probes_ignored += 1
@@ -574,11 +673,25 @@ class CoachJob:
             elif not (os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')):
                 print('[voice] GEMINI_API_KEY is MISSING: voice OFF', flush=True)
             else:
-                persona = read_text(a.persona, DEFAULT_PERSONA)
-                if a.plan: plan_line = f'\n\nFor your own reference only, never to be read aloud: the session plan, in order, is {a.plan}.'
+                persona = read_text(a.persona, DEFAULT_PERSONA); tools = []
+                try:
+                    so_far = self.streaks.peek(self.profile)
+                    if so_far['current'] > 1: persona += (f"\n\nThis caller has worked out {so_far['current']} day(s) in a row so far (their best is {so_far['best']}); "
+                                                          "welcome them back and mention the streak once in your greeting.")
+                except Exception as e: log.warning('streak peek: %r', e)
+                if getattr(a, 'mirror', False) and not self.voice_mode:
+                    persona += ("\n\nWhen the whole workout is done, the caller's results card appears on their screen: in your closing line, "
+                                "tell them to take a screenshot and share it.")
+                if not self.voice_mode:                                   # the session tools: "I'm ready" and "can you see me?"
+                    persona += SESSION_TOOLS_PROMPT; tools += self.session_tools()
+                if getattr(a, 'intake', False):
+                    programs = load_programs(); persona += programs.INTAKE_PROMPT; tools.append(self.intake_tool(programs))
+                    self.boxing = load_starter('boxing.py'); persona += self.boxing.BOXING_PROMPT; tools.append(self.boxing_tool(self.boxing))
+                    plan_line = f'\n\nFor your own reference only, never to be read aloud: if the caller chooses nothing, the plan is {a.plan}.'
+                elif a.plan: plan_line = f'\n\nFor your own reference only, never to be read aloud: the session plan, in order, is {a.plan}.'
                 elif getattr(a, 'plan_text', None): plan_line = '\n\nThe plan you are coaching, step by step (follow it in order, one step at a time; never read it aloud):\n' + a.plan_text
                 else: plan_line = ''
-                model = GeminiModel(persona + plan_line, model=a.voice_model, voice=a.voice_name, on_turn=self.emit_voice)
+                model = GeminiModel(persona + plan_line, model=a.voice_model, voice=a.voice_name, on_turn=self.emit_voice, tools=tools)
         if getattr(a, 'vision', False):
             if model is None: print('[vision] --vision needs --voice gemini with a model session: no video is forwarded', flush=True)
             else: self.vision = VideoTee(fps=a.vision_fps)
@@ -597,6 +710,176 @@ class CoachJob:
         else:
             print(f'[voice] handlers {hpath} (say_now only; no model: ask_voice returns None)', flush=True)
         return v
+
+    def make_card(self):
+        """The results card: saved under data/cards/ and, with --mirror, shown on the caller's screen from now on."""
+        try:
+            from facetime.recap import card_image, card_frame, CARDS_DIR
+            import datetime as _dt
+            img = card_image(self.recap, self.day); now = _dt.datetime.now()
+            path = os.path.join(CARDS_DIR, f'brodie-{now:%Y%m%d-%H%M%S}.png'); os.makedirs(CARDS_DIR, exist_ok=True); img.save(path)
+            self.card_path = path; self.card_img = card_frame(img)
+            print(f'[recap] results card saved: {path}' + (' (shown on the call)' if self.mirror_task is not None else ''), flush=True)
+        except Exception as e: log.warning('results card: %r', e)
+
+    def _speaking(self):
+        """Brodie is audible: a bank clip playing, or the voice's reply still in the mixer."""
+        pl = self.player
+        if pl is None: return False
+        mix = getattr(pl, 'mix', None)
+        return pl.playing is not None or (mix is not None and mix.pending > 0)
+
+    def _mirror_frame(self, av, compose, W, H):
+        """One RGB24 frame (runs in a thread): the newest caller frame composed with the session state, else the face alone."""
+        src = self.mirror_src; s = self.per.session if self.per is not None else None
+        face = av.frame(speaking=self._speaking())
+        if self.card_img is not None: img = self.card_img                    # the workout is done: the results card, for a screenshot
+        elif src is None or s is None: img = np.asarray(face.resize((W, H)))
+        elif self.lesson is not None and s.state == 'lesson':
+            rgb, lm = src                                                    # a boxing lesson: style and round clock in the top bar
+            img = compose(rgb, lm, 0, None, f"{self.lesson['style']} boxing", self.lesson['status'], self.last_cue[0], self.last_cue[1], face)
+        else:
+            rgb, lm = src
+            img = compose(rgb, lm, s.last_count, s.target, self.pipe.exercise, s.state, self.last_cue[0], self.last_cue[1], face)
+        return rtc.VideoFrame(W, H, rtc.VideoBufferType.RGB24, np.ascontiguousarray(img).tobytes()).convert(rtc.VideoBufferType.I420)
+
+    async def mirror_loop(self):
+        """--mirror: the coach's video track (as coach_agent --mirror): published at join, like the audio, so a FaceTime video call has
+        the agent's video from the start (Chert: the speaking participant publishes audio and video). Rendering runs off the loop.
+        Any failure is logged and leaves the call alone."""
+        try:
+            from facetime.avatar import Avatar
+            from facetime.mirror import compose, W, H
+            av = Avatar(); fps = max(1.0, min(float(getattr(self.a, 'mirror_fps', 10.0) or 10.0), 15.0))
+            source = rtc.VideoSource(W, H)
+            track = rtc.LocalVideoTrack.create_video_track('coach-video', source)
+            await self.room.local_participant.publish_track(track, rtc.TrackPublishOptions(
+                source=rtc.TrackSource.SOURCE_CAMERA, simulcast=False, video_encoding=rtc.VideoEncoding(max_framerate=int(fps), max_bitrate=1_500_000)))
+            print(f'[worker] published video track coach-video {W}x{H} at {fps:g} fps (mirror)', flush=True)
+            period = 1.0 / fps; next_t = self.loop.time()
+            while not self.stop.is_set():
+                source.capture_frame(await asyncio.to_thread(self._mirror_frame, av, compose, W, H))
+                next_t = max(next_t + period, self.loop.time()); await asyncio.sleep(max(0.0, next_t - self.loop.time()))
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f'[worker] mirror stopped: {e!r}', flush=True)
+
+    def session_tools(self):
+        """start_next_set (the caller is ready: skip the rest) and check_view (what the pose tracker sees: the model sees no video)."""
+        from livekit.agents import function_tool
+
+        @function_tool(description='The caller says they are ready (for example "let\'s go", "I\'m ready", "next"): skip the rest and start the '
+                                   'next exercise now (in a boxing lesson: end the current rest or round and move to the next round). Only during a rest, right before a '
+                                   'set, or in a boxing lesson.')
+        async def start_next_set() -> str:
+            if self.per is None: return 'No workout is running.'
+            if self.lesson is not None and self.lesson_task is not None and not self.lesson_task.done():   # a boxing lesson: end the rest or the round
+                self.lesson['skip'] = True; print('[voice] start_next_set -> lesson: moving on', flush=True)
+                return 'Moving on now: say one short encouraging line; the next part of the lesson starts as soon as you finish.'
+            why = self.per.session.request_next()
+            print(f'[voice] start_next_set -> ' + ('accepted' if why is None else f'refused: {why}'), flush=True)
+            return 'Starting the next exercise as soon as you finish this sentence; say one short encouraging line.' if why is None else f'Not possible now ({why}).'
+
+        @function_tool(description='What the camera currently shows of the caller, from the pose tracker. Call it whenever the caller asks '
+                                   'whether you can see them or how they should stand. You cannot see the video yourself.')
+        async def check_view() -> str:
+            per = self.per
+            if per is None or self.first_frame_t is None: return 'No video from the caller yet.'
+            state = per._vis_emitted or 'none'
+            return {'full': 'The whole body is in view: head to feet.',
+                    'partial': 'Only part of the body is in view (usually the feet or the head are cut off): ask them to step back or move the phone further away.',
+                    'none': 'Nobody is in view right now.'}.get(state, 'Unknown.') + (' Counting is paused until the whole body is back in view.' if per._paused else '')
+
+        @function_tool(description='How the caller\'s guard and stance look right now, measured by the pose tracker (hand height, feet width). '
+                                   'Call it when the caller asks how their form, guard or stance looks.')
+        async def check_form() -> str:
+            if self.per is None or self.pipe is None: return 'No video from the caller yet.'
+            if self.boxing is None: self.boxing = load_starter('boxing.py')
+            text, _ = self.boxing.form_report(self.pipe.last_landmarks)
+            return text or 'The tracker cannot see the arms and shoulders clearly right now: ask them to step back into view.'
+
+        return [start_next_set, check_view, check_form]
+
+    def boxing_tool(self, boxing):
+        """start_boxing_lesson: the intake's other branch. The session leaves the intake for 'lesson'; the timeline runs here."""
+        from typing import Literal
+        from livekit.agents import function_tool
+        styles = tuple(boxing.STYLES)
+
+        @function_tool(description=f'Start a shadowboxing lesson in one style ({", ".join(styles)}) instead of a workout. Call it during the intake '
+                                   'as soon as the caller picks a boxing style.')
+        async def start_boxing_lesson(style: Literal[styles]) -> str:
+            if self.per is None: return 'No session is running.'
+            if self.lesson is not None: return 'A lesson is already running.'
+            why = self.per.session.start_lesson()
+            print(f'[voice] boxing lesson: {style} -> ' + ('accepted' if why is None else f'refused: {why}'), flush=True)
+            if why is not None: return f'The lesson cannot start now ({why}).'
+            st = boxing.STYLES[style]; self.lesson = dict(style=style, title=st['title'], status='getting ready')
+            self.recap.plan_label = f"{st['title']} boxing"
+            self.lesson_task = asyncio.create_task(self.run_lesson(boxing, style), name='boxing-lesson')
+            return (f"Lesson set: {st['title']}, {len(st['drills'])} rounds of {boxing.ROUND_S} seconds. Now, in three or four short sentences: "
+                    f"the style's big idea ({st['idea']}), the stance ({st['stance']}) and the guard ({st['guard']}); ask them to clear some "
+                    "space and get into the stance. Round one comes after that.")
+        return start_boxing_lesson
+
+    async def run_lesson(self, boxing, style):
+        """The lesson's timeline (starter/boxing.py run_lesson) with the worker's verbs; at the end: the streak, the card, 'done'."""
+        job = self
+        class Coach:
+            round_s = boxing.ROUND_S; rest_s = boxing.REST_S
+            def ask(self, prompt):
+                r = job.voice.ask_voice(prompt) if job.voice is not None else None
+                print(f'[lesson] ask ({r}): {prompt[:70]!r}', flush=True); return r
+            def say(self, text):
+                if job._voice_audible() or (job.player is not None and job.player.playing is not None): return None   # never over Brodie's voice
+                print(f'[lesson] cue: {text!r}', flush=True)
+                return job.voice.say_now(text) if job.voice is not None else None
+            def form_data(self): return boxing.form_report(job.pipe.last_landmarks if job.pipe is not None else None)[1]
+            def status(self, text): job.lesson['status'] = text
+            def skip(self):
+                if job.lesson.get('skip'): job.lesson['skip'] = False; return True
+                return False
+            def form(self): return boxing.form_report(job.pipe.last_landmarks if job.pipe is not None else None)[0]
+            def log(self, text): print(f'[lesson] {text}', flush=True)
+            async def wait_quiet(self, max_s):
+                t0 = time.monotonic(); quiet = None
+                while time.monotonic() - t0 < max_s:
+                    await asyncio.sleep(0.1); now = time.monotonic()
+                    quiet = None if job._voice_audible() else (quiet or now)
+                    if quiet is not None and now - quiet >= 0.8 and now - t0 > 1.5: return
+        try:
+            taught = await boxing.run_lesson(style, Coach())
+            st = boxing.STYLES[style]; self.recap.lesson = dict(style=style, title=st['title'], drills=taught)
+            try: self.day = self.streaks.record(self.profile)
+            except Exception as e: log.warning('streak: %r', e)
+            if self.voice is not None:
+                streak = (f" This was day {self.day['current']} in a row for the caller; mention it." if self.day and self.day['current'] > 1 else
+                          ' This was their first day: invite them back tomorrow to start a streak.')
+                self.voice.summary.done_note = (f"The {st['title']} boxing lesson is over ({len(taught)} rounds: {', '.join(taught)}). In the close, name the "
+                                                f"style's one key idea ({st['idea']}) and suggest practising round one again tomorrow." + streak)
+            print(f'[lesson] {st["title"]} done: {len(taught)} rounds', flush=True)
+            self.per.session.finish_lesson()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.warning('boxing lesson failed: %r', e); print(f'[lesson] stopped: {e!r}', flush=True)
+
+    def intake_tool(self, programs):
+        """--intake: the choose_workout function tool. The model passes the caller's goal and level; starter/programs.py turns them
+        into a plan from its templates; the session starts it once nobody is talking. The tool's answer is what the model says next."""
+        from typing import Literal
+        from livekit.agents import function_tool
+        goals = tuple(programs.GOALS); levels = tuple(programs.LEVELS)
+
+        @function_tool(description='Set today\'s workout from the caller\'s goal and level. Call it once, during the intake, as soon as '
+                                   f'you know both (goal one of {", ".join(goals)}; level one of {", ".join(levels)}).')
+        async def choose_workout(goal: Literal[goals], level: Literal[levels]) -> str:
+            plan, rest_s, said = programs.build(goal, level); self.recap.plan_label = f'{level} {goal}'
+            why = self.voice.set_plan(plan, rest_s) if self.voice is not None else 'no voice layer'
+            if why is not None: return f'The workout could not be changed ({why}); carry on with the current plan.'
+            return f'Workout set: {said}. Tell the caller in one short sentence, then ask them to step back so their whole body is in view.'
+        return choose_workout
 
     def emit_voice(self, role, text):
         """A model (or caller) turn as an event of type voice {text, t, role}: the queue, the JSONL log, the console (own seq counter)."""
@@ -617,6 +900,7 @@ class CoachJob:
         if self.cue_log: self.cue_log.write(json.dumps(rec) + '\n'); self.cue_log.flush()
         if rec['status'] == 'played':
             self.cues_played += 1
+            if rec.get('intent') not in ('probe', 'beep'): self.last_cue = (rec.get('text'), time.time())   # the mirror's bottom bar
             lat = '' if rec.get('t_decision') is None else f"  decision->push {1000 * (rec['t_push'] - rec['t_decision']):.0f} ms"
             if rec['intent'] == 'probe' and rec.get('t_recv') is not None:
                 lat = f"  first up frame recv -> beep pushed {1000 * (rec['t_push'] - rec['t_recv']):.0f} ms (detect -> push {1000 * (rec['t_push'] - rec['t_detect']):.0f}, on-box {rec.get('on_box_ms')} ms)"

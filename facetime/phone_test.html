@@ -7,7 +7,8 @@
 <!--
 Tier (c): open this page on a phone to stand in for the Chert bridge without FaceTime.
 It joins the LiveKit room as the bridge identity (default "chert-bridge"), publishes the environment-facing (or front, with &facing=user)
-camera (1280x720 if the phone allows) as a video track named "facetime-remote-video", and plays whatever the
+camera (1280x720 if the phone allows) as a video track named "facetime-remote-video", the microphone as "facetime-remote-audio"
+(so the voice can hear the caller, as on a FaceTime call), and plays whatever the
 coach ("brodie-agent") publishes on its audio track. Query string or form: ?url=wss://...&token=...&identity=...
 Mint the token with:  .venv/bin/python -m facetime.mint_token --room <room> --url
 Serve the file over https or open it as a local file in Safari (camera access needs a secure context or file://).
@@ -47,6 +48,7 @@ Serve the file over https or open it as a local file in Safari (camera access ne
   <div class="stat"><b>Coach present</b> <span id="agent" class="bad">no</span></div>
   <div class="stat"><b>Coach audio</b> <span id="audio">none</span></div>
   <div class="stat"><b>Camera</b> <span id="cam">off</span></div>
+  <div class="stat"><b>Microphone</b> <span id="mic">off</span></div>
 </div>
 <div class="card"><video id="preview" autoplay playsinline muted></video></div>
 <div class="card"><div id="log"></div></div>
@@ -56,12 +58,15 @@ const $ = id => document.getElementById(id);
 for (const k of ['url','token','identity']) if (q.get(k)) $(k).value = q.get(k);
 const AGENT = q.get('agent') || 'brodie-agent';
 const TRACK_NAME = 'facetime-remote-video';
+const MIC_NAME = 'facetime-remote-audio';
 const log = m => { const t = new Date().toISOString().slice(11,23); $('log').textContent = `${t} ${m}\n` + $('log').textContent; };
 let room = null, audioEls = [];
 function setAgent(present) { $('agent').textContent = present ? 'yes' : 'no'; $('agent').className = present ? 'ok' : 'bad'; }
 async function join() {
   const url = $('url').value.trim(), token = $('token').value.trim();
   if (!url || !token) { log('need url and token'); return; }
+  if (room) { log('already joined'); return; }   // a second join with the same identity kicks the first out of the room
+  $('join').disabled = true;
   const LK = window.LivekitClient;
   room = new LK.Room({ adaptiveStream: false, dynacast: false });
   room.on(LK.RoomEvent.ConnectionStateChanged, s => { $('state').textContent = s; log('state ' + s); });
@@ -71,10 +76,12 @@ async function join() {
     log(`subscribed ${pub.kind} "${pub.trackName}" from ${p.identity}`);
     if (track.kind === 'audio') { const el = track.attach(); el.autoplay = true; document.body.appendChild(el); audioEls.push(el); $('audio').textContent = 'playing from ' + p.identity;
       el.play().catch(() => { $('unmute').style.display = 'inline-block'; }); }
-    if (track.kind === 'video' && p.identity === AGENT) {   // the coach's avatar (--avatar): shown small, what the FaceTime caller would see
+    if (track.kind === 'video' && (p.identity === AGENT || p.identity.startsWith('agent-'))) {   // agent-<job id>: the worker under dev (--mirror)   // the coach's avatar (--avatar): shown small, what the FaceTime caller would see
       let v = document.getElementById('agentvideo');
       if (!v) { v = document.createElement('video'); v.id = 'agentvideo'; v.autoplay = true; v.playsInline = true; v.muted = true;
-        v.style.cssText = 'position:fixed;right:8px;bottom:8px;width:120px;border:1px solid #888;border-radius:8px;z-index:9'; document.body.appendChild(v); }
+        v.style.cssText = 'position:fixed;right:8px;bottom:8px;width:min(45vw,360px);border:1px solid #888;border-radius:8px;z-index:9'; document.body.appendChild(v);
+        v.onclick = () => { const big = v.dataset.big !== '1'; v.dataset.big = big ? '1' : '0';     // tap: full screen (the results card), tap again: small
+          v.style.width = big ? '100vw' : 'min(45vw,360px)'; v.style.right = big ? '0' : '8px'; v.style.bottom = big ? '0' : '8px'; v.style.maxHeight = big ? '100vh' : ''; }; }
       track.attach(v); log('agent video ' + pub.trackName + ' attached'); }
   });
   room.on(LK.RoomEvent.TrackUnsubscribed, (track) => { if (track.kind === 'audio') { track.detach().forEach(e => e.remove()); $('audio').textContent = 'none'; } });
@@ -91,10 +98,15 @@ async function join() {
     const s = track.mediaStreamTrack.getSettings();
     $('cam').textContent = `${s.width}x${s.height} @${s.frameRate || '?'} fps (${s.facingMode || 'unknown facing'}) as "${TRACK_NAME}"`;
     log('published ' + TRACK_NAME);
-    $('join').disabled = true; $('leave').disabled = false;
-  } catch (e) { log('ERROR ' + (e && e.message || e)); $('state').textContent = 'error'; }
+    try {   // the caller's voice, as the Chert bridge sends it on a FaceTime call; without it the coach can never hear a question
+      const mic = await LK.createLocalAudioTrack({ echoCancellation: true, noiseSuppression: true, autoGainControl: true });
+      await room.localParticipant.publishTrack(mic, { name: MIC_NAME, source: LK.Track.Source.Microphone });
+      $('mic').textContent = 'on as "' + MIC_NAME + '"'; log('published ' + MIC_NAME);
+    } catch (e) { $('mic').textContent = 'off (' + (e && e.message || e) + ')'; log('mic failed: ' + (e && e.message || e)); }
+    $('leave').disabled = false;
+  } catch (e) { log('ERROR ' + (e && e.message || e)); $('state').textContent = 'error'; if (room) { room.disconnect(); room = null; } $('join').disabled = false; }
 }
-async function leave() { if (room) { await room.disconnect(); room = null; } audioEls.forEach(e => e.remove()); audioEls = []; $('join').disabled = false; $('leave').disabled = true; $('cam').textContent = 'off'; setAgent(false); }
+async function leave() { if (room) { await room.disconnect(); room = null; } audioEls.forEach(e => e.remove()); audioEls = []; $('join').disabled = false; $('leave').disabled = true; $('cam').textContent = 'off'; $('mic').textContent = 'off'; setAgent(false); }
 $('join').onclick = join; $('leave').onclick = leave;
 $('unmute').onclick = async () => { if (room) await room.startAudio(); audioEls.forEach(e => e.play().catch(() => {})); $('unmute').style.display = 'none'; };
 if (q.get('autojoin') === '1' && $('url').value && $('token').value) join();

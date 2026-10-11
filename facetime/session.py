@@ -27,6 +27,19 @@ held 1.5 s (facetime/probe.py TPose). Plan mode: in 'active' the set is closed t
 line "Okay, moving on" (then the rest and the next exercise as usual); in 'rest' the next exercise starts at once; in 'wait' the
 Coach is armed. Single mode: "Okay, moving on", the Coach is detached and the session is done (the agent still leaves the room
 on --once / --max-s as today). Auto mode ignores it (logged once). A held cue is dropped on every one of these boundaries.
+Intake (opt-in, intake=True, the worker's --intake, plan mode only): once someone is in frame the session enters 'intake' and
+says nothing; the voice asks the caller's goal and level and calls set_plan() (from any thread). The new plan starts on the
+first frame with no conversation hold ("Let's do X"); with no set_plan within intake_timeout_s (hold time not counted) the
+configured plan runs.
+Lesson (start_lesson() / finish_lesson(), any thread; the voice's start_boxing_lesson tool, starter/boxing.py): from the intake the
+session enters 'lesson' (no counting, no clock: the worker runs the lesson's timeline), then 'done' when the lesson ends. Both
+transitions happen on the next frame even when the caller is out of view.
+Out of view (lost_close_s, 15 s by default; 0 = off): a set whose caller has been out of view that long is closed with the count
+reached, so the session moves to the rest (where the voice may speak) instead of waiting forever.
+Auto-start (rest_autostart, on by default): rest_min_s (3 s) into a rest the next exercise's rep counter runs in warm-up; the first
+rep it counts starts the set ("Moving on to X", that rep kept), so a caller who just starts moving is counted without saying "ready".
+Next (request_next(), any thread; the voice's start_next_set tool): in 'rest' the next exercise starts, in 'wait' the Coach is armed,
+on the first frame with no conversation hold (the voice finishes its sentence first).
 Cues go out through say(text, intent, meta); intents: announce, milestone, correction, count, positive, start.
 """
 import logging
@@ -75,8 +88,12 @@ def parse_plan(s):
 class Session:
     def __init__(self, pipe, say, fps=10, plan=None, exercise=None, announce=True, rest_s=5.0, set_timeout_s=75.0,
                  wait_s=3.0, tempo=None, tempo_every_s=15.0, detect_hold_s=3.0, detect_every_s=10.0, detect_margin=0.3, auto_classes='demo', wait_here_s=30.0, hold_s=0.7, clip_s=None,
-                 gesture_next=False):
+                 gesture_next=False, intake=False, intake_timeout_s=60.0, lost_close_s=15.0, rest_autostart=True, rest_min_s=3.0):
         self.pipe = pipe; self.say_cb = say; self.fps = fps
+        self.intake = bool(intake) and bool(plan); self.intake_timeout_s = intake_timeout_s; self.pending_plan = None
+        self.lost_close_s = lost_close_s; self.lost_n = 0; self.next_requested = False; self.n_lost_closed = 0
+        self.rest_autostart = rest_autostart; self.rest_min_s = rest_min_s; self.preloaded = None; self.n_autostart = 0
+        self.lesson_requested = False; self.lesson_finished = False
         self.gesture_next = gesture_next; self.n_gesture = 0; self._gesture_auto_logged = False
         self.plan = parse_plan(plan) if plan else None; self.single = exercise; self.announce = announce
         self.mode = 'plan' if self.plan else ('single' if exercise else 'auto')
@@ -103,10 +120,14 @@ class Session:
 
     def _start_exercise(self, name, line, meta):
         """Fresh Coach for `name` in warm-up (counter only) until the wait ends; the session script replaces the Coach's
-        own start line, and nothing the Coach would say during the wait is generated or recorded."""
+        own start line, and nothing the Coach would say during the wait is generated or recorded. A counter already warmed up
+        during the rest (auto-start) is kept with the reps it counted."""
         self.say(line, 'announce', meta)
-        self.pipe.set_exercise(name, params=dict(start_line=False), armed=False); self.name = name
-        self.last_count = 0; self.rep_t = []; self._drop_held('exercise changed'); self._enter('wait')
+        if self.preloaded == name and self.pipe.coach is not None: self.name = name          # auto-start: keep the counter and its reps
+        else:
+            self.pipe.set_exercise(name, params=dict(start_line=False), armed=False); self.name = name
+            self.last_count = 0; self.rep_t = []
+        self.preloaded = None; self._drop_held('exercise changed'); self._enter('wait')
 
     def _track_reps(self, r, meta):
         c = r['count']
@@ -181,17 +202,27 @@ class Session:
         """r: FramePipeline.process() result. Call once per processed frame, in order. Frames with the body not fully
         visible do not advance the session clock (set timeouts, rests and waits pause with the Coach)."""
         meta = meta or {}
+        if self.lesson_requested and self.state in ('init', 'intake'):   # a lesson instead of a workout (any visibility)
+            self.lesson_requested = False; self._enter('lesson')
+        if self.lesson_finished and self.state == 'lesson':
+            self.lesson_finished = False; self.done = True; self._enter('done')
         for text in r.get('vis_cues', []):
-            self.say(text, 'visibility', meta, why='visibility')
+            if not self.done: self.say(text, 'visibility', meta, why='visibility')   # after "All done" nobody needs to step back
         if not r.get('visible', True):
             self._drop_held('not visible')                                 # never replay a cue after a visibility pause
+            self.lost_n += 1
+            if self.mode == 'plan' and self.state == 'active' and self.lost_close_s and self.lost_n >= self.lost_close_s * self.fps:
+                self.n_lost_closed += 1; c = self.last_count                # out of view too long: close the set, the rest lets the voice help
+                self._close_set(meta, f"That's {number_word(min(c, 30))}, nice work" if c >= 1 else 'Nice work', f'out of view {self.lost_close_s:.0f}s')
             if self.mode == 'plan' and r.get('no_pose_s', 0.0) >= self.wait_here_s and not self.said_wait_here:
                 self.said_wait_here = True; self.say(WAIT_HERE, 'visibility', meta, why=f'no pose for {self.wait_here_s:.0f} s')
             return
         if r.get('ok', True): self.said_wait_here = False
+        self.lost_n = 0
         self.i += 1; self.t = self.i / self.fps
-        if r.get('hold') and self.state in ('wait', 'rest'): self.t_state += 1.0 / self.fps   # conversation hold (voice layer): the rest or wait does not run out while the caller and the coach are talking
+        if r.get('hold') and self.state in ('wait', 'rest', 'intake'): self.t_state += 1.0 / self.fps   # conversation hold (voice layer): the rest or wait does not run out while the caller and the coach are talking
         if self.gesture_next and r.get('gesture_next') and self._gesture(r, meta): return   # the command frame replaces the frame's own cues
+        if self.state == 'lesson': return                                  # the worker runs the lesson; nothing per frame
         if self.mode == 'plan': self._plan(r, meta)
         elif self.mode == 'single': self._single(r, meta)
         else: self._auto(r, meta)
@@ -227,7 +258,20 @@ class Session:
     def _plan(self, r, meta):
         if self.state == 'init':
             if not r.get('ok', True) or r.get('vis_cues'): return   # start when someone is in frame; one frame after "Great, I can see you"
+            if self.intake: self._enter('intake'); return
             self.k = 0; name, self.target = self.plan[0]; self._start_exercise(name, f"Let's do {name}", meta); return
+        if self.state == 'intake':
+            pending = self.pending_plan
+            if pending is not None and not r.get('hold'):                  # chosen, and nobody is talking: start it
+                self.pending_plan = None; self.plan, rest_s = pending
+                if rest_s is not None: self.rest_s = rest_s
+            elif self.t - self.t_state < self.intake_timeout_s: return
+            else: log.warning('intake: no plan chosen in %.0f s, running the configured plan', self.intake_timeout_s)
+            self.k = 0; name, self.target = self.plan[0]; self._start_exercise(name, f"Let's do {name}", meta); return
+        if self.next_requested and self.state in ('wait', 'rest') and not r.get('hold'):    # the caller said they are ready
+            self.next_requested = False; self._drop_held('next requested')
+            if self.state == 'rest': self._next_exercise(meta); return
+            self.pipe.arm(); self._enter('active'); self._track_reps(r, meta); return
         if self.state == 'wait':
             moving = r['moving'] or (not self.pipe.countable and r['ok'])
             if moving or self.t - self.t_state >= self.wait_s: self.pipe.arm(); self._enter('active')
@@ -238,8 +282,42 @@ class Session:
         if self.state == 'rest':
             if not self.said_rest and self.t - self.t_state >= 1.5:
                 self.said_rest = True; self.say('Rest for a moment', 'positive', meta)
+            nxt = self.plan[self.k + 1] if self.k + 1 < len(self.plan) else None
+            if self.rest_autostart and nxt is not None:
+                if self.preloaded is None and self.t - self.t_state >= self.rest_min_s:
+                    self.pipe.set_exercise(nxt[0], params=dict(start_line=False), armed=False); self.preloaded = nxt[0]   # counter only, nothing said
+                    self.last_count = 0; self.rep_t = []
+                elif self.preloaded is not None:
+                    self._track_reps(r, meta)
+                    if self.last_count >= 1:                                        # a real rep of the next exercise: start the set now
+                        self.n_autostart += 1; self._next_exercise(meta); return
             if self.t - self.t_state >= self.rest_s: self._next_exercise(meta)
             return
+
+    def set_plan(self, plan, rest_s=None):
+        """Intake: the plan the caller chose ("squats:12,pushups:10"), started on a later frame (any thread may call this; the
+        frame thread picks it up). Returns None when accepted, else why not (a bad name, or the session is already past intake)."""
+        if not self.intake or self.state not in ('init', 'intake'): return f'too late: the session is in {self.state}'
+        try:
+            items = parse_plan(plan)
+            for name, _ in items: map_exercise(name, self.pipe.clf)
+        except (SystemExit, ValueError) as e: return str(e)
+        if not items or any(n <= 0 for _, n in items): return f'empty or non-positive plan: {plan!r}'
+        self.pending_plan = (items, rest_s); return None
+
+    def start_lesson(self):
+        """The caller chose a boxing lesson in the intake (any thread). None when accepted, else why not."""
+        if self.mode != 'plan' or self.state not in ('init', 'intake'): return f'too late: the session is in {self.state}'
+        self.lesson_requested = True; return None
+
+    def finish_lesson(self):
+        """The lesson's timeline ended: 'done' on the next frame."""
+        self.lesson_finished = True
+
+    def request_next(self):
+        """The caller is ready (any thread): skip the rest / start counting now. None when accepted, else why not."""
+        if self.mode != 'plan' or self.state not in ('wait', 'rest'): return f'nothing to skip: the session is in {self.state}'
+        self.next_requested = True; return None
 
     def _next_exercise(self, meta):
         """End of the rest (or the T-pose command during it): the next plan item, or the closing line."""
@@ -259,6 +337,7 @@ class Session:
         """The set is over (target reached, timed out, or the T-pose command): milestone line, held cue dropped, Coach detached, rest."""
         self.say(line, 'milestone', meta, why=why)
         self._drop_held('set closed'); self.pipe.detach(); self.said_rest = False; self._enter('rest')
+        if self.mode == 'plan' and self.plan and self.k + 1 >= len(self.plan): self._next_exercise(meta)   # the last set: "All done" at once, no rest
 
     def _auto(self, r, meta):
         if self.state == 'init':
