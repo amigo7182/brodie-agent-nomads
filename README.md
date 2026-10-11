@@ -94,9 +94,14 @@ The same pages are at [seraphimlabs.dev/hackathon](https://seraphimlabs.dev/hack
 A FaceTime fitness coach that sets up your workout by talking to you, shows you your own form on the call, and hands you a
 card to share at the end. No app: call the number.
 
-Run it (phone page or FaceTime, same command; add `--agent-name <name>` for the Chert line):
+Run it on the phone page or in Safari (empty `AGENT_NAME` in `.env.local`):
 ```
 python -m facetime.worker --voice gemini --intake --mirror --log-caller dev
+```
+On the Chert FaceTime line, our agent is `brodie-boxer` (two terminals; then a FaceTime Video call to the line):
+```
+python -m facetime.worker --agent-name brodie-boxer --voice gemini --intake --mirror --log-caller dev
+chert doctor && chert dev --agent brodie-boxer
 ```
 
 | Feature | What the caller gets | Where |
